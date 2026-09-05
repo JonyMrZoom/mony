@@ -46,6 +46,7 @@ const DEFAULTS = {
 };
 
 const ACCENTS = ["#C2410C", "#15803D", "#1D4ED8", "#7C3AED", "#0E7490", "#9D174D"];
+const TINTS = ["#F4EAE3", "#E7EFE7", "#E7EAF3", "#EEE9F4", "#E4EEEF", "#F3E8EC"];
 const KIND_RU = { in: "Приход", out: "Расход", self: "Изъятие себе" };
 
 const delta = (e) => (e.kind === "in" ? e.amount : e.kind === "out" ? -e.amount : 0);
@@ -87,6 +88,7 @@ export default function Kassa() {
   const syncTimer = useRef(null);
   const blocked = useRef(false);
   const touch = useRef(null);
+  const [slide, setSlide] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -199,6 +201,100 @@ export default function Kassa() {
     }
   };
 
+  const pull = async (silent = false) => {
+    if (!data?.sheetUrl) return;
+    if (!silent) setSync({ state: "run", msg: "Читаю таблицу…" });
+    let remote;
+    try {
+      const r = await fetch(data.sheetUrl + "?pull=1");
+      remote = await r.json();
+      if (!remote.ok) throw new Error(remote.error || "ошибка");
+    } catch (err) {
+      if (!silent)
+        setSync({ state: "err", msg: "Не удалось прочитать таблицу: " + err.message });
+      return;
+    }
+
+    const rows = remote.rows || [];
+    const byKey = new Map(rows.map((r) => [r.id || "sr" + r.row, r]));
+    const accByName = (name) =>
+      data.accounts.find((a) => a.name.toLowerCase() === String(name || "").toLowerCase());
+
+    const fromRow = (r, base) => {
+      const parts = String(r.note || "").split(" · ");
+      const hit = accByName(parts[0]);
+      return {
+        ...(base || {}),
+        id: r.id || "sr" + r.row,
+        ts: r.ts || base?.ts || Date.now(),
+        amount: Math.abs(Number(r.amount) || 0),
+        cat: r.cat || "",
+        kind: r.kind === "Расход" ? "out" : r.kind === "Изъятие себе" ? "self" : "in",
+        acct: hit ? hit.id : base?.acct || data.accounts[0].id,
+        note: hit ? parts.slice(1).join(" · ") : r.note || "",
+        sent: true,
+      };
+    };
+
+    const local = [];
+    let changed = 0;
+    let gone = 0;
+    data.entries.forEach((e) => {
+      if (!e.sent) return local.push(e);
+      const r = byKey.get(e.id);
+      if (!r) {
+        // строку стёрли в таблице — убираем и у себя, но только если чтение живое
+        if (rows.length) return gone++;
+        return local.push(e);
+      }
+      byKey.delete(e.id);
+      const upd = fromRow(r, e);
+      if (upd.amount !== e.amount || upd.cat !== e.cat || upd.kind !== e.kind) changed++;
+      local.push(upd);
+    });
+
+    // строки, заведённые в таблице руками
+    let fresh = 0;
+    byKey.forEach((r) => {
+      local.push(fromRow(r, null));
+      fresh++;
+    });
+
+    local.sort((a, b) => b.ts - a.ts);
+
+    const next = { ...data, entries: local };
+    if (remote.settings && !data.catsDirty) {
+      const inList = remote.settings.in || [];
+      const outList = remote.settings.out || [];
+      if (inList.length) next.cats = { in: inList, out: outList.length ? outList : data.cats.out };
+    }
+    persist(next);
+
+    if (!silent || changed || gone || fresh) {
+      const parts = [];
+      if (fresh) parts.push("новых из таблицы: " + fresh);
+      if (changed) parts.push("исправлено: " + changed);
+      if (gone) parts.push("удалено: " + gone);
+      setSync({
+        state: "ok",
+        msg: parts.length ? "Из таблицы — " + parts.join(", ") : "Совпадает с таблицей",
+      });
+    }
+  };
+
+  const syncNow = async () => {
+    await push(false);
+    await pull(false);
+  };
+
+  // разовое чтение при запуске
+  const pulledOnce = useRef(false);
+  useEffect(() => {
+    if (!data?.sheetUrl || pulledOnce.current) return;
+    pulledOnce.current = true;
+    pull(true);
+  }, [data]);
+
   useEffect(() => {
     if (!data?.sheetUrl || blocked.current) return;
     const pending =
@@ -258,6 +354,7 @@ export default function Kassa() {
     const i = data.accounts.findIndex((a) => a.id === acct);
     const n = data.accounts.length;
     const next = data.accounts[(i + (dx < 0 ? 1 : -1) + n) % n];
+    setSlide(dx < 0 ? "left" : "right");
     setAcct(next.id);
   };
 
@@ -284,9 +381,11 @@ export default function Kassa() {
 
   const pending =
     data.entries.filter((e) => !e.sent).length + (data.dels || []).length;
+  const tintIndex = Math.max(0, data.accounts.findIndex((a) => a.id === acct));
+  const tint = TINTS[tintIndex % TINTS.length];
 
   return (
-    <div style={S.shell}>
+    <div style={{ ...S.shell, background: tint }}>
       <Style />
       <div style={S.frame}>
         <header style={S.header}>
@@ -296,7 +395,7 @@ export default function Kassa() {
           </div>
           <div style={S.headerRight}>
             {data.sheetUrl && (
-              <button className="k-pill" onClick={() => push(false)}>
+              <button className="k-pill" onClick={syncNow}>
                 <span
                   className="k-dot"
                   style={{
@@ -323,12 +422,15 @@ export default function Kassa() {
 
         {view !== "settings" && (
           <div style={S.acctRow} role="group" aria-label="Куда пришли деньги">
-            {data.accounts.map((a) => (
+            {data.accounts.map((a, i) => (
               <button
                 key={a.id}
                 className={"k-acct" + (acct === a.id ? " on" : "")}
                 style={acct === a.id ? { borderColor: acctColor(a.id) } : {}}
-                onClick={() => setAcct(a.id)}
+                onClick={() => {
+                  setSlide(i > tintIndex ? "left" : "right");
+                  setAcct(a.id);
+                }}
               >
                 <span className="k-dot" style={{ background: acctColor(a.id) }} />
                 {a.name}
@@ -339,6 +441,7 @@ export default function Kassa() {
 
         <main style={S.main} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
           {view === "add" && (
+            <div key={acct} className={slide ? "k-slide-" + slide : undefined}>
             <AddView
               data={data}
               add={add}
@@ -351,6 +454,7 @@ export default function Kassa() {
                 setPad({ amount: "", cat: data.cats.in[0], kind: "in", note: "" })
               }
             />
+            </div>
           )}
           {view === "log" && (
             <LogView
@@ -370,7 +474,7 @@ export default function Kassa() {
             />
           )}
           {view === "settings" && (
-            <SettingsView data={data} persist={persist} setCats={setCats} />
+            <SettingsView data={data} persist={persist} setCats={setCats} onPull={() => pull(false)} />
           )}
         </main>
 
@@ -386,7 +490,7 @@ export default function Kassa() {
           </div>
         )}
 
-        <nav style={S.tabs}>
+        <nav style={{ ...S.tabs, background: tint }}>
           {[
             ["add", "Запись"],
             ["log", "Все"],
@@ -764,7 +868,7 @@ function StatsView({ data, month, setMonth, acctName, acctColor }) {
 
 /* ---------- настройки ---------- */
 
-function SettingsView({ data, persist, setCats }) {
+function SettingsView({ data, persist, setCats, onPull }) {
   const [newAcct, setNewAcct] = useState("");
   const [newCat, setNewCat] = useState({ in: "", out: "" });
   const [pAmount, setPAmount] = useState("");
@@ -781,7 +885,11 @@ function SettingsView({ data, persist, setCats }) {
       />
       <p style={S.hint}>
         Записи, удаления и правки списков уходят в таблицу сами через несколько секунд.
+        Обратно приложение читает таблицу при каждом запуске.
       </p>
+      <button className="k-ghost wide" style={{ marginTop: 10 }} onClick={onPull}>
+        Прочитать таблицу сейчас
+      </button>
 
       <div style={S.blockHead}>Счета и карты</div>
       <ul style={S.list}>
@@ -961,7 +1069,7 @@ const LINE = "#DDE0DA";
 const S = {
   shell: {
     minHeight: "100%",
-    background: "#ECEEE9",
+    transition: "background .25s ease",
     padding: "14px 12px 24px",
     fontFamily:
       "ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
@@ -1234,6 +1342,11 @@ function Style() {
         padding: 8px 13px; border-radius: 999px; font: inherit; font-size: 13px;
         cursor: pointer; flex-shrink: 0;
       }
+
+      @keyframes k-in-left  { from { opacity: 0; transform: translateX(26px); } to { opacity: 1; transform: none; } }
+      @keyframes k-in-right { from { opacity: 0; transform: translateX(-26px); } to { opacity: 1; transform: none; } }
+      .k-slide-left  { animation: k-in-left .22s ease-out; }
+      .k-slide-right { animation: k-in-right .22s ease-out; }
 
       button:focus-visible { outline: 2px solid #15653F; outline-offset: 2px; }
       @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
