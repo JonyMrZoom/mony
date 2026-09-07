@@ -4,10 +4,10 @@ const KEY = "kassa-v1";
 
 const DEFAULTS = {
   accounts: [
-    { id: "a1", name: "Т-Банк" },
-    { id: "a2", name: "Сбер" },
-    { id: "a3", name: "Наличные" },
-    { id: "a4", name: "Р/с ИП", freeOnly: true, biz: true },
+    { id: "a1", name: "Т-Банк", pal: 0 },
+    { id: "a2", name: "Сбер", pal: 1 },
+    { id: "a3", name: "Наличные", pal: 2 },
+    { id: "a4", name: "Р/с ИП", pal: 3, freeOnly: true, biz: true },
   ],
   presets: [
     { id: "p1", amount: 650, label: "Разовая тренировка", cat: "Тренировки и абонементы" },
@@ -43,10 +43,40 @@ const DEFAULTS = {
   sheetUrl: "",
   entries: [],
   dels: [],
+  upds: [],
 };
 
-const ACCENTS = ["#C2410C", "#15803D", "#1D4ED8", "#7C3AED", "#0E7490", "#9D174D"];
-const TINTS = ["#F4EAE3", "#E7EFE7", "#E7EAF3", "#EEE9F4", "#E4EEEF", "#F3E8EC"];
+// Палитра счетов: акцент (точка, обводка) и подсветка страницы
+const PALETTE = [
+  { c: "#D19A00", t: "#F8F2DA" }, // жёлтый
+  { c: "#15803D", t: "#E7EFE7" }, // зелёный
+  { c: "#1D4ED8", t: "#E7EAF3" }, // синий
+  { c: "#7C3AED", t: "#EEE9F4" }, // фиолетовый
+  { c: "#0E7490", t: "#E2EEF0" }, // бирюзовый
+  { c: "#C2410C", t: "#F5EAE2" }, // оранжевый
+  { c: "#9D174D", t: "#F4E7EC" }, // малиновый
+  { c: "#4D7C0F", t: "#EDF1E2" }, // оливковый
+];
+
+// Подбирает цвет, которого ещё нет у других счетов
+const freePal = (accounts) => {
+  const used = new Set(accounts.map((a) => a.pal));
+  for (let i = 0; i < PALETTE.length; i++) if (!used.has(i)) return i;
+  return accounts.length % PALETTE.length;
+};
+
+// Для счетов, заведённых до появления цветов
+const guessPal = (name, taken) => {
+  const n = String(name).toLowerCase();
+  const wish =
+    /т-?банк|тинь/.test(n) ? 0 :
+    /сбер/.test(n) ? 1 :
+    /налич|кэш|cash/.test(n) ? 2 :
+    /р\/с|расчёт|расчет|ип/.test(n) ? 3 : null;
+  if (wish !== null && !taken.has(wish)) return wish;
+  for (let i = 0; i < PALETTE.length; i++) if (!taken.has(i)) return i;
+  return 0;
+};
 const KIND_RU = { in: "Приход", out: "Расход", self: "Изъятие себе" };
 
 const delta = (e) => (e.kind === "in" ? e.amount : e.kind === "out" ? -e.amount : 0);
@@ -76,7 +106,39 @@ const dayLabel = (ts) => {
   return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
 };
 
-export default function Kassa() {
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { err: null };
+  }
+  static getDerivedStateFromError(err) {
+    return { err };
+  }
+  render() {
+    if (!this.state.err) return this.props.children;
+    const text = String(this.state.err && (this.state.err.stack || this.state.err.message));
+    return (
+      <div style={{ padding: 20, fontFamily: "ui-monospace, monospace", fontSize: 13 }}>
+        <p style={{ fontWeight: 700, marginBottom: 8 }}>Сбой в приложении</p>
+        <pre style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{text}</pre>
+        <button
+          onClick={() => navigator.clipboard?.writeText(text)}
+          style={{ marginTop: 12, padding: "12px 16px", fontSize: 15 }}
+        >
+          Скопировать текст ошибки
+        </button>
+        <button
+          onClick={() => location.reload()}
+          style={{ marginTop: 12, marginLeft: 8, padding: "12px 16px", fontSize: 15 }}
+        >
+          Перезапустить
+        </button>
+      </div>
+    );
+  }
+}
+
+function KassaApp() {
   const [data, setData] = useState(null);
   const [view, setView] = useState("add");
   const [acct, setAcct] = useState(null);
@@ -89,6 +151,9 @@ export default function Kassa() {
   const blocked = useRef(false);
   const touch = useRef(null);
   const [slide, setSlide] = useState(null);
+  const [crash, setCrash] = useState(null);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -102,9 +167,36 @@ export default function Kassa() {
       const merged = { ...DEFAULTS, ...(parsed || {}) };
       if (Array.isArray(merged.cats)) merged.cats = DEFAULTS.cats;
       if (!Array.isArray(merged.dels)) merged.dels = [];
+      if (!Array.isArray(merged.upds)) merged.upds = [];
+      const taken = new Set(
+        merged.accounts.filter((a) => a.pal !== undefined).map((a) => a.pal)
+      );
+      merged.accounts = merged.accounts.map((a) => {
+        if (a.pal !== undefined) return a;
+        const pal = guessPal(a.name, taken);
+        taken.add(pal);
+        return { ...a, pal };
+      });
       setData(merged);
-      setAcct(merged.lastAcct || merged.accounts[0].id);
+      const today = new Date().toDateString();
+      let start = merged.accounts.find((a) => a.id === merged.lastAcct);
+      if ((!start || (merged.lastDay !== today && (start.biz || start.freeOnly))))
+        start = merged.accounts.find((a) => !a.biz && !a.freeOnly) || merged.accounts[0];
+      setAcct(start.id);
     })();
+  }, []);
+
+  useEffect(() => {
+    const onErr = (ev) => {
+      const e = ev.error || ev.reason;
+      setCrash(String((e && (e.stack || e.message)) || ev.message || ev.reason));
+    };
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onErr);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onErr);
+    };
   }, []);
 
   const persist = async (next) => {
@@ -118,10 +210,12 @@ export default function Kassa() {
 
   const acctById = (id) => data?.accounts.find((a) => a.id === id);
   const acctName = (id) => acctById(id)?.name || "—";
-  const acctColor = (id) => {
-    const i = data ? data.accounts.findIndex((a) => a.id === id) : 0;
-    return ACCENTS[(i < 0 ? 0 : i) % ACCENTS.length];
+  const palOf = (id) => {
+    const a = data?.accounts.find((x) => x.id === id);
+    const i = a?.pal;
+    return PALETTE[(i === undefined ? 0 : i) % PALETTE.length];
   };
+  const acctColor = (id) => palOf(id).c;
 
   /* ---------- обмен с таблицей ---------- */
 
@@ -132,12 +226,26 @@ export default function Kassa() {
     }
     const batch = data.entries.filter((e) => !e.sent);
     const dels = data.dels || [];
+    const upds = (data.upds || [])
+      .map((id) => data.entries.find((e) => e.id === id))
+      .filter(Boolean);
     const needCats = !!data.catsDirty;
-    if (!batch.length && !dels.length && !needCats) {
+    if (!batch.length && !dels.length && !upds.length && !needCats) {
       if (!silent) setSync({ state: "ok", msg: "Всё уже в таблице" });
       return;
     }
     setSync({ state: "run", msg: "Синхронизирую…" });
+
+    const wire = (e) => ({
+      id: e.id,
+      ts: e.ts,
+      time: timeStr(e.ts),
+      kind: KIND_RU[e.kind] || "Приход",
+      amount: e.amount,
+      cat: e.kind === "self" ? "" : e.cat,
+      scope: e.kind === "self" || acctById(e.acct)?.biz ? "Бизнес" : "Личное",
+      note: [acctName(e.acct), e.note].filter(Boolean).join(" · "),
+    });
 
     const body = JSON.stringify({
       entries: batch.map((e) => ({
@@ -151,6 +259,7 @@ export default function Kassa() {
         note: [acctName(e.acct), e.note].filter(Boolean).join(" · "),
       })),
       deletes: dels,
+      updates: upds.map(wire),
       settings: needCats ? { in: data.cats.in, out: data.cats.out } : null,
     });
 
@@ -176,22 +285,24 @@ export default function Kassa() {
         ok = true;
         blind = true;
       } catch (e2) {
-        blocked.current = true;
+        blocked.current = Date.now();
         setSync({ state: "err", msg: "Таблица недоступна. Проверьте ссылку и доступ «Все»." });
       }
     }
 
     if (ok) {
-      blocked.current = false;
+      blocked.current = 0;
       const ids = new Set(batch.map((e) => e.id));
       persist({
         ...data,
         entries: data.entries.map((e) => (ids.has(e.id) ? { ...e, sent: true } : e)),
         dels: [],
+        upds: [],
         catsDirty: false,
       });
       const parts = [];
       if (batch.length) parts.push("записей: " + batch.length);
+      if (upds.length) parts.push("исправлено: " + upds.length);
       if (dels.length) parts.push("удалено: " + dels.length);
       if (needCats) parts.push("списки обновлены");
       setSync({
@@ -295,45 +406,147 @@ export default function Kassa() {
     pull(true);
   }, [data]);
 
+  const pendingCount = data
+    ? data.entries.filter((e) => !e.sent).length +
+      (data.dels || []).length +
+      (data.upds || []).length
+    : 0;
+
   useEffect(() => {
-    if (!data?.sheetUrl || blocked.current) return;
-    const pending =
-      data.entries.some((e) => !e.sent) || (data.dels || []).length > 0 || data.catsDirty;
-    if (!pending) return;
+    if (!data?.sheetUrl) return;
+    if (!pendingCount && !data.catsDirty) return;
+    const cooling = blocked.current && Date.now() - blocked.current < 60000;
+    const wait = cooling ? 60000 : 14000;
     clearTimeout(syncTimer.current);
-    syncTimer.current = setTimeout(() => push(true), 4000);
+    syncTimer.current = setTimeout(() => push(true), wait);
     return () => clearTimeout(syncTimer.current);
+  }, [data]);
+
+  // вернулись из фона — экран записи, свежие данные, счёт под новый день
+  const awayAt = useRef(Date.now());
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "hidden") {
+        awayAt.current = Date.now();
+        return;
+      }
+      if (Date.now() - awayAt.current < 600000) return;
+      setView("add");
+      setToast(null);
+      if (data) {
+        const cur = data.accounts.find((a) => a.id === acct);
+        if (data.lastDay !== new Date().toDateString() && cur && (cur.biz || cur.freeOnly)) {
+          const safe = data.accounts.find((a) => !a.biz && !a.freeOnly);
+          if (safe) setAcct(safe.id);
+        }
+        if (data.sheetUrl) pull(true);
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [data, acct]);
+
+  // сеть вернулась — сразу дожимаем очередь
+  useEffect(() => {
+    const onOnline = () => {
+      blocked.current = 0;
+      if (data?.sheetUrl) push(true);
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
   }, [data]);
 
   /* ---------- операции ---------- */
 
+  useEffect(() => {
+    if (sync.state !== "ok" || !sync.msg) return;
+    const t = setTimeout(() => setSync({ state: "idle", msg: "" }), 5000);
+    return () => clearTimeout(t);
+  }, [sync]);
+
   const showToast = (t) => {
     setToast(t);
     clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 7000);
+    toastTimer.current = setTimeout(() => setToast(null), 11000);
   };
 
-  const add = (amount, cat, kind = "in", note = "") => {
+  const add = (amount, cat, kind = "in", note = "", ts = null, useAcct = null) => {
+    const lastCat = { ...(data.lastCat || {}) };
+    if (cat) lastCat[kind] = cat;
     const entry = {
       id: "e" + Date.now() + Math.random().toString(36).slice(2, 6),
-      ts: Date.now(),
+      ts: ts || Date.now(),
       amount: Number(amount),
       cat,
       kind,
-      acct,
+      acct: useAcct || acct,
       note,
     };
-    persist({ ...data, entries: [entry, ...data.entries], lastAcct: acct });
+    const entries = [entry, ...data.entries].sort((a, b) => b.ts - a.ts);
+    persist({
+      ...data,
+      entries,
+      lastAcct: acct,
+      lastCat,
+      lastDay: new Date().toDateString(),
+    });
+    setNoteOpen(false);
     showToast(entry);
+  };
+
+  const saveNote = () => {
+    const note = noteDraft.trim();
+    persist({
+      ...data,
+      entries: data.entries.map((e) => (e.id === toast.id ? { ...e, note } : e)),
+    });
+    setToast({ ...toast, note });
+    setNoteOpen(false);
+  };
+
+  const update = (patch) => {
+    const entry = data.entries.find((e) => e.id === patch.id);
+    if (!entry) return;
+    const next = { ...entry, ...patch };
+    const upds = entry.sent
+      ? [...new Set([...(data.upds || []), entry.id])]
+      : data.upds || [];
+    const lastCat = { ...(data.lastCat || {}) };
+    if (next.cat) lastCat[next.kind] = next.cat;
+    persist({
+      ...data,
+      entries: data.entries
+        .map((e) => (e.id === patch.id ? next : e))
+        .sort((a, b) => b.ts - a.ts),
+      upds,
+      lastCat,
+    });
+    setToast(null);
   };
 
   const remove = (entry) => {
     const dels = entry.sent
       ? [...(data.dels || []), { id: entry.id, ts: entry.ts, amount: entry.amount }]
       : data.dels || [];
-    persist({ ...data, entries: data.entries.filter((e) => e.id !== entry.id), dels });
+    persist({
+      ...data,
+      entries: data.entries.filter((e) => e.id !== entry.id),
+      dels,
+      upds: (data.upds || []).filter((id) => id !== entry.id),
+    });
     if (toast && toast.id === entry.id) setToast(null);
   };
+
+  const openEdit = (e) =>
+    setPad({
+      id: e.id,
+      amount: String(e.amount),
+      cat: e.cat,
+      kind: e.kind,
+      note: e.note || "",
+      acct: e.acct,
+      ts: e.ts,
+    });
 
   const setCats = (kind, list) =>
     persist({ ...data, cats: { ...data.cats, [kind]: list }, catsDirty: true });
@@ -364,6 +577,23 @@ export default function Kassa() {
     return data.entries.filter((e) => monthKey(e.ts) === mk).reduce((s, e) => s + delta(e), 0);
   }, [data]);
 
+  const frequent = useMemo(() => {
+    if (!data) return [];
+    const since = Date.now() - 60 * 86400000;
+    const presetSums = new Set(data.presets.map((p) => p.amount));
+    const tally = {};
+    data.entries.forEach((e) => {
+      if (e.kind !== "in" || e.ts < since || presetSums.has(e.amount)) return;
+      const k = e.amount + "|" + e.cat;
+      tally[k] = (tally[k] || 0) + 1;
+    });
+    return Object.entries(tally)
+      .filter(([, n]) => n >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([k]) => ({ amount: Number(k.split("|")[0]), cat: k.split("|")[1] }));
+  }, [data]);
+
   const todayEntries = useMemo(() => {
     if (!data) return [];
     const dk = dayKey(Date.now());
@@ -379,19 +609,17 @@ export default function Kassa() {
     );
   }
 
-  const pending =
-    data.entries.filter((e) => !e.sent).length + (data.dels || []).length;
-  const tintIndex = Math.max(0, data.accounts.findIndex((a) => a.id === acct));
-  const tint = TINTS[tintIndex % TINTS.length];
+  const pending = pendingCount;
+  const tint = view === "add" ? palOf(acct).t : "#ECEEE9";
 
   return (
     <div style={{ ...S.shell, background: tint }}>
       <Style />
-      <div style={S.frame}>
+      <div className="k-frame" style={S.frame}>
         <header style={S.header}>
           <div>
             <div style={S.headerLabel}>{monthName(monthKey(Date.now()))}</div>
-            <div style={S.headerSum}>{money(thisMonth)}</div>
+            <div className="k-headsum" style={S.headerSum}>{money(thisMonth)}</div>
           </div>
           <div style={S.headerRight}>
             {data.sheetUrl && (
@@ -416,26 +644,51 @@ export default function Kassa() {
           </div>
         </header>
 
-        {sync.msg && (
-          <div style={sync.state === "err" ? S.err : S.syncNote}>{sync.msg}</div>
+        {crash && (
+          <div style={S.err}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>Ошибка</div>
+            <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 12 }}>
+              {crash}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button className="k-link" onClick={() => navigator.clipboard?.writeText(crash)}>
+                Скопировать
+              </button>
+              <button className="k-link" onClick={() => setCrash(null)}>
+                Скрыть
+              </button>
+            </div>
+          </div>
         )}
 
-        {view !== "settings" && (
+        {sync.state === "err" && sync.msg && <div style={S.err}>{sync.msg}</div>}
+
+        {view === "add" && (
           <div style={S.acctRow} role="group" aria-label="Куда пришли деньги">
-            {data.accounts.map((a, i) => (
+            {data.accounts.map((a, i) => {
+              const n = data.accounts.length;
+              const full = Math.floor(n / 3) * 3;
+              const span = i < full ? 2 : 6 / (n - full);
+              return (
               <button
                 key={a.id}
                 className={"k-acct" + (acct === a.id ? " on" : "")}
-                style={acct === a.id ? { borderColor: acctColor(a.id) } : {}}
+                style={{
+                  gridColumn: "span " + span,
+                  ...(acct === a.id ? { borderColor: acctColor(a.id) } : {}),
+                }}
                 onClick={() => {
-                  setSlide(i > tintIndex ? "left" : "right");
+                  setSlide(
+                    i > data.accounts.findIndex((x) => x.id === acct) ? "left" : "right"
+                  );
                   setAcct(a.id);
                 }}
               >
                 <span className="k-dot" style={{ background: acctColor(a.id) }} />
-                {a.name}
+                <span className="k-acct-name">{a.name}</span>
               </button>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -445,13 +698,22 @@ export default function Kassa() {
             <AddView
               data={data}
               add={add}
+              frequent={frequent}
               activeAcct={acctById(acct)}
               todayEntries={todayEntries}
               acctName={acctName}
               acctColor={acctColor}
               onDelete={remove}
+              onEdit={openEdit}
               openPad={() =>
-                setPad({ amount: "", cat: data.cats.in[0], kind: "in", note: "" })
+                setPad({
+                  amount: "",
+                  cat: data.lastCat?.in || data.cats.in[0],
+                  kind: "in",
+                  note: "",
+                  acct,
+                  ts: Date.now(),
+                })
               }
             />
             </div>
@@ -462,6 +724,9 @@ export default function Kassa() {
               acctName={acctName}
               acctColor={acctColor}
               onDelete={remove}
+              onEdit={openEdit}
+              onPull={() => pull(false)}
+              syncing={sync.state === "run"}
             />
           )}
           {view === "stats" && (
@@ -478,15 +743,50 @@ export default function Kassa() {
           )}
         </main>
 
+        {sync.state !== "err" && sync.msg && !toast && (
+          <div style={S.syncFloat} role="status">
+            {sync.msg}
+          </div>
+        )}
+
         {toast && (
           <div style={S.toast} role="status">
-            <span>
-              {KIND_RU[toast.kind]} <b>{money(toast.amount)}</b>
-              {toast.cat ? " · " + toast.cat : ""}
-            </span>
-            <button className="k-undo" onClick={() => remove(toast)}>
-              Отменить
-            </button>
+            {noteOpen ? (
+              <>
+                <input
+                  className="k-toast-input"
+                  autoFocus
+                  placeholder="Кто заплатил"
+                  value={noteDraft}
+                  onChange={(ev) => setNoteDraft(ev.target.value)}
+                  onKeyDown={(ev) => ev.key === "Enter" && saveNote()}
+                />
+                <button className="k-undo" onClick={saveNote}>
+                  Готово
+                </button>
+              </>
+            ) : (
+              <>
+                <span style={{ minWidth: 0 }}>
+                  <b>{money(toast.amount)}</b> · {acctName(toast.acct)}
+                  {toast.note ? " · " + toast.note : ""}
+                </span>
+                <span style={{ display: "flex", gap: 7, flexShrink: 0 }}>
+                  <button
+                    className="k-undo"
+                    onClick={() => {
+                      setNoteDraft(toast.note || "");
+                      setNoteOpen(true);
+                    }}
+                  >
+                    Имя
+                  </button>
+                  <button className="k-undo" onClick={() => remove(toast)}>
+                    Отменить
+                  </button>
+                </span>
+              </>
+            )}
           </div>
         )}
 
@@ -512,8 +812,10 @@ export default function Kassa() {
           data={data}
           state={pad}
           setState={setPad}
-          onSave={(amount, cat, kind, note) => {
-            add(amount, cat, kind, note);
+          acctColor={acctColor}
+          onSave={(v) => {
+            if (v.id) update(v);
+            else add(v.amount, v.cat, v.kind, v.note, v.ts, v.acct);
             setPad(null);
           }}
           onClose={() => setPad(null)}
@@ -523,42 +825,85 @@ export default function Kassa() {
   );
 }
 
+export default function Kassa() {
+  return (
+    <ErrorBoundary>
+      <KassaApp />
+    </ErrorBoundary>
+  );
+}
+
 /* ---------- строка операции ---------- */
 
-function EntryRow({ e, acctName, acctColor, onDelete }) {
+function EntryRow({ e, acctName, acctColor, onDelete, onEdit }) {
+  const [ask, setAsk] = useState(false);
   return (
     <li style={S.row}>
       <span style={{ ...S.bar, background: acctColor(e.acct) }} />
-      <span style={S.rowTime}>{timeStr(e.ts)}</span>
-      <span style={S.rowCat}>
-        {e.cat || KIND_RU[e.kind]}
-        {e.note ? <em style={S.note}> · {e.note}</em> : null}
-      </span>
-      <span style={S.rowAcct}>{acctName(e.acct)}</span>
-      <span style={{ ...S.rowSum, color: sumColor(e) }}>
-        {sumPrefix(e)}
-        {nf.format(e.amount)}
-      </span>
-      <button className="k-del" onClick={() => onDelete(e)} aria-label="Удалить запись">
-        ✕
-      </button>
+      {ask ? (
+        <>
+          <span style={{ ...S.rowCat, flex: 1 }}>Удалить запись?</span>
+          <button className="k-link danger" onClick={() => onDelete(e)}>
+            Удалить
+          </button>
+          <button className="k-link" onClick={() => setAsk(false)}>
+            Отмена
+          </button>
+        </>
+      ) : (
+        <>
+          <button className="k-rowmain" onClick={() => onEdit && onEdit(e)}>
+            <span style={S.rowTime}>{timeStr(e.ts)}</span>
+            <span style={S.rowCat}>
+              {e.cat || KIND_RU[e.kind]}
+              {e.note ? <em style={S.note}> · {e.note}</em> : null}
+            </span>
+            <span style={S.rowAcct}>{acctName(e.acct)}</span>
+            <span style={{ ...S.rowSum, color: sumColor(e) }}>
+              {sumPrefix(e)}
+              {nf.format(e.amount)}
+              {!e.sent && <span style={S.pendingDot} title="Ещё не в таблице" />}
+            </span>
+          </button>
+          <button className="k-del" onClick={() => setAsk(true)} aria-label="Удалить запись">
+            ✕
+          </button>
+        </>
+      )}
     </li>
   );
 }
 
 /* ---------- экран записи ---------- */
 
-function AddView({ data, add, activeAcct, todayEntries, acctName, acctColor, onDelete, openPad }) {
+function AddView({ data, add, frequent, activeAcct, todayEntries, acctName, acctColor, onDelete, onEdit, openPad }) {
   const sum = todayEntries.reduce((s, e) => s + delta(e), 0);
   const freeOnly = !!activeAcct?.freeOnly;
+  const [flash, setFlash] = useState(null);
+  const flashRef = useRef(null);
+  const hit = (key, amount, cat) => {
+    add(amount, cat);
+    setFlash(key);
+    clearTimeout(flashRef.current);
+    flashRef.current = setTimeout(() => setFlash(null), 900);
+  };
   return (
     <>
-      <div style={S.presets}>
+      <div className="k-presets" style={S.presets}>
         {!freeOnly &&
           data.presets.map((p) => (
-            <button key={p.id} className="k-preset" onClick={() => add(p.amount, p.cat)}>
-              <span className="k-preset-sum">{nf.format(p.amount)}</span>
-              <span className="k-preset-label">{p.label}</span>
+            <button
+              key={p.id}
+              className={"k-preset" + (flash === p.id ? " done" : "")}
+              onClick={() => hit(p.id, p.amount, p.cat)}
+            >
+              <span className="k-preset-text">
+                <span className="k-preset-sum">{nf.format(p.amount)}</span>
+                <span className="k-preset-label">
+                  {flash === p.id ? "Записано" : p.label}
+                </span>
+              </span>
+              <span className="k-preset-plus">{flash === p.id ? "✓" : "+"}</span>
             </button>
           ))}
         <button className={"k-preset" + (freeOnly ? " solo" : " alt")} onClick={openPad}>
@@ -568,6 +913,20 @@ function AddView({ data, add, activeAcct, todayEntries, acctName, acctColor, onD
           </span>
         </button>
       </div>
+
+      {!freeOnly && frequent.length > 0 && (
+        <div style={S.freqRow}>
+          {frequent.map((f) => (
+            <button
+              key={f.amount + f.cat}
+              className={"k-freq" + (flash === "f" + f.amount ? " done" : "")}
+              onClick={() => hit("f" + f.amount, f.amount, f.cat)}
+            >
+              {nf.format(f.amount)}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div style={S.sectionHead}>
         <span>Сегодня · {todayEntries.length}</span>
@@ -585,6 +944,7 @@ function AddView({ data, add, activeAcct, todayEntries, acctName, acctColor, onD
               acctName={acctName}
               acctColor={acctColor}
               onDelete={onDelete}
+              onEdit={onEdit}
             />
           ))}
         </ul>
@@ -596,18 +956,30 @@ function AddView({ data, add, activeAcct, todayEntries, acctName, acctColor, onD
 
 /* ---------- клавиатура ---------- */
 
-function Pad({ data, state, setState, onSave, onClose }) {
+function Pad({ data, state, setState, acctColor, onSave, onClose }) {
   const press = (d) => {
     if (d === "del") return setState({ ...state, amount: state.amount.slice(0, -1) });
     if (state.amount.length > 8) return;
     setState({ ...state, amount: (state.amount + d).replace(/^0+/, "") });
   };
   const value = Number(state.amount || 0);
+  const editing = !!state.id;
+
+  const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
+  const shiftDay = (n) => {
+    const base = new Date(state.ts || Date.now());
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    d.setHours(base.getHours(), base.getMinutes(), 0, 0);
+    setState({ ...state, ts: d.getTime() });
+  };
+  const isoDate = new Date(state.ts || Date.now()).toISOString().slice(0, 10);
 
   return (
     <div style={S.sheetWrap} onClick={onClose}>
-      <div style={S.sheet} onClick={(ev) => ev.stopPropagation()}>
+      <div className="k-sheet" style={S.sheet} onClick={(ev) => ev.stopPropagation()}>
         <div style={S.grabber} />
+
         <div style={S.padTop}>
           <div style={S.kindSwitch}>
             {["in", "out", "self"].map((k) => (
@@ -618,7 +990,11 @@ function Pad({ data, state, setState, onSave, onClose }) {
                   setState({
                     ...state,
                     kind: k,
-                    cat: k === "in" ? data.cats.in[0] : k === "out" ? data.cats.out[0] : "",
+                    cat:
+                      k === "self"
+                        ? ""
+                        : data.lastCat?.[k] ||
+                          (k === "in" ? data.cats.in[0] : data.cats.out[0]),
                   })
                 }
               >
@@ -629,22 +1005,81 @@ function Pad({ data, state, setState, onSave, onClose }) {
           <div style={S.padSum}>{state.amount ? nf.format(value) : "0"} ₽</div>
         </div>
 
+        <div className="k-scroll" style={S.catRow}>
+          {state.dateOpen ? (
+            <>
+              {[0, 1, 2].map((n) => (
+                <button
+                  key={n}
+                  className={
+                    "k-chip" +
+                    (sameDay(state.ts || Date.now(), Date.now() - n * 86400000) ? " on" : "")
+                  }
+                  onClick={() => shiftDay(n)}
+                >
+                  {["Сегодня", "Вчера", "Позавчера"][n]}
+                </button>
+              ))}
+              <label className="k-chip date">
+                Другой день
+                <input
+                  type="date"
+                  value={isoDate}
+                  max={new Date().toISOString().slice(0, 10)}
+                  onChange={(ev) => {
+                    if (!ev.target.value) return;
+                    const base = new Date(state.ts || Date.now());
+                    const d = new Date(ev.target.value + "T00:00:00");
+                    d.setHours(base.getHours(), base.getMinutes(), 0, 0);
+                    setState({ ...state, ts: d.getTime() });
+                  }}
+                />
+              </label>
+            </>
+          ) : (
+            <button
+              className={"k-chip" + (sameDay(state.ts || Date.now(), Date.now()) ? "" : " on")}
+              onClick={() => setState({ ...state, dateOpen: true })}
+            >
+              {dayLabel(state.ts || Date.now())} ⌄
+            </button>
+          )}
+        </div>
+
+        {editing && (
+          <div className="k-scroll" style={S.catRow}>
+            {data.accounts.map((a) => (
+              <button
+                key={a.id}
+                className={"k-chip" + (state.acct === a.id ? " on" : "")}
+                onClick={() => setState({ ...state, acct: a.id })}
+              >
+                <span className="k-dot" style={{ background: acctColor(a.id), marginRight: 6 }} />
+                {a.name}
+              </button>
+            ))}
+          </div>
+        )}
+
         {state.kind === "self" ? (
           <p style={S.hint}>
             Перевод с бизнес-счёта себе на карту. В журнал уйдёт строка «Изъятие себе» — в
             отчёте по бизнесу это ваша зарплата.
           </p>
         ) : (
-          <div style={S.catRow}>
-            {(state.kind === "in" ? data.cats.in : data.cats.out).map((c) => (
-              <button
-                key={c}
-                className={"k-chip" + (state.cat === c ? " on" : "")}
-                onClick={() => setState({ ...state, cat: c })}
-              >
-                {c}
-              </button>
-            ))}
+          <div className="k-scroll" style={S.catRow}>
+            {(state.kind === "in" ? data.cats.in : data.cats.out)
+              .slice()
+              .sort((a, b) => (a === state.cat ? -1 : b === state.cat ? 1 : 0))
+              .map((c) => (
+                <button
+                  key={c}
+                  className={"k-chip" + (state.cat === c ? " on" : "")}
+                  onClick={() => setState({ ...state, cat: c })}
+                >
+                  {c}
+                </button>
+              ))}
           </div>
         )}
 
@@ -655,7 +1090,7 @@ function Pad({ data, state, setState, onSave, onClose }) {
           onChange={(ev) => setState({ ...state, note: ev.target.value })}
         />
 
-        <div style={S.pad}>
+        <div className="k-pad" style={S.pad}>
           {["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "del"].map((d) => (
             <button key={d} className="k-key" onClick={() => press(d)}>
               {d === "del" ? "⌫" : d}
@@ -670,9 +1105,19 @@ function Pad({ data, state, setState, onSave, onClose }) {
           <button
             className="k-save"
             disabled={!value}
-            onClick={() => onSave(value, state.cat, state.kind, state.note.trim())}
+            onClick={() =>
+              onSave({
+                id: state.id,
+                amount: value,
+                cat: state.kind === "self" ? "" : state.cat,
+                kind: state.kind,
+                note: state.note.trim(),
+                ts: state.ts,
+                acct: state.acct,
+              })
+            }
           >
-            Записать
+            {editing ? "Сохранить" : "Записать"}
           </button>
         </div>
       </div>
@@ -682,53 +1127,100 @@ function Pad({ data, state, setState, onSave, onClose }) {
 
 /* ---------- все записи ---------- */
 
-function LogView({ data, acctName, acctColor, onDelete }) {
-  const [q, setQ] = useState("");
-  const filtered = data.entries.filter(
-    (e) =>
-      !q ||
-      (e.cat || "").toLowerCase().includes(q.toLowerCase()) ||
-      (e.note || "").toLowerCase().includes(q.toLowerCase()) ||
-      String(e.amount).includes(q)
-  );
-  const groups = [];
-  filtered.forEach((e) => {
-    const k = dayKey(e.ts);
-    const last = groups[groups.length - 1];
-    if (last && last.k === k) last.items.push(e);
-    else groups.push({ k, ts: e.ts, items: [e] });
+function LogView({ data, acctName, acctColor, onDelete, onEdit, onPull, syncing }) {
+  const nowKey = monthKey(Date.now());
+  const [openMonths, setOpenMonths] = useState([nowKey]);
+
+  // месяц → дни → записи
+  const months = [];
+  data.entries.forEach((e) => {
+    const mk = monthKey(e.ts);
+    let m = months[months.length - 1];
+    if (!m || m.key !== mk) {
+      m = { key: mk, items: [], days: [] };
+      months.push(m);
+    }
+    m.items.push(e);
+    const dk = dayKey(e.ts);
+    const d = m.days[m.days.length - 1];
+    if (d && d.key === dk) d.items.push(e);
+    else m.days.push({ key: dk, ts: e.ts, items: [e] });
   });
+
+  const isOpen = (mk) => openMonths.includes(mk);
+  const toggle = (mk) =>
+    setOpenMonths(
+      openMonths.includes(mk) ? openMonths.filter((x) => x !== mk) : [...openMonths, mk]
+    );
+
+  const notSent = data.entries.filter((e) => !e.sent).length;
 
   return (
     <>
-      <input
-        className="k-input"
-        placeholder="Поиск: имя, категория, сумма"
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-      />
-      {groups.length === 0 && <p style={S.empty}>Ничего не нашлось.</p>}
-      {groups.map((g) => (
-        <div key={g.k}>
-          <div style={S.sectionHead}>
-            <span>{dayLabel(g.ts)}</span>
-            <span style={{ fontWeight: 700, color: "#16191A" }}>
-              {money(g.items.reduce((s, e) => s + delta(e), 0))}
-            </span>
+      <div style={S.logBar}>
+        <span>
+          {notSent
+            ? notSent + " ещё не в таблице"
+            : data.entries.length
+            ? "Всё сходится с таблицей"
+            : "Пока пусто"}
+        </span>
+        <button className="k-link" onClick={onPull} disabled={syncing}>
+          {syncing ? "Читаю…" : "Обновить"}
+        </button>
+      </div>
+
+      {months.length === 0 && <p style={S.empty}>Записей пока нет.</p>}
+
+      {months.map((m) => {
+        const inc = m.items.filter((e) => e.kind === "in").reduce((s, e) => s + e.amount, 0);
+        const out = m.items.filter((e) => e.kind === "out").reduce((s, e) => s + e.amount, 0);
+        const open = isOpen(m.key);
+        return (
+          <div key={m.key} style={S.section}>
+            <button className="k-section" onClick={() => toggle(m.key)}>
+              <span style={S.sectionText}>
+                <span style={S.sectionTitle}>
+                  {monthName(m.key).charAt(0).toUpperCase() + monthName(m.key).slice(1)}
+                </span>
+                <span style={S.sectionSummary}>
+                  {m.items.length} операций
+                  {out ? " · расход " + money(out) : ""}
+                </span>
+              </span>
+              <span style={S.monthSum}>{money(inc - out)}</span>
+              <span className={"k-chev" + (open ? " on" : "")}>›</span>
+            </button>
+
+            {open && (
+              <div style={{ paddingTop: 4 }}>
+                {m.days.map((g) => (
+                  <div key={g.key}>
+                    <div style={S.sectionHead}>
+                      <span>{dayLabel(g.ts)}</span>
+                      <span style={{ fontWeight: 700, color: INK }}>
+                        {money(g.items.reduce((s, e) => s + delta(e), 0))}
+                      </span>
+                    </div>
+                    <ul style={S.list}>
+                      {g.items.map((e) => (
+                        <EntryRow
+                          key={e.id}
+                          e={e}
+                          acctName={acctName}
+                          acctColor={acctColor}
+                          onDelete={onDelete}
+                          onEdit={onEdit}
+                        />
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          <ul style={S.list}>
-            {g.items.map((e) => (
-              <EntryRow
-                key={e.id}
-                e={e}
-                acctName={acctName}
-                acctColor={acctColor}
-                onDelete={onDelete}
-              />
-            ))}
-          </ul>
-        </div>
-      ))}
+        );
+      })}
     </>
   );
 }
@@ -868,194 +1360,275 @@ function StatsView({ data, month, setMonth, acctName, acctColor }) {
 
 /* ---------- настройки ---------- */
 
+function Section({ title, summary, open, onToggle, children }) {
+  return (
+    <div style={S.section}>
+      <button className="k-section" onClick={onToggle}>
+        <span style={S.sectionText}>
+          <span style={S.sectionTitle}>{title}</span>
+          <span style={S.sectionSummary}>{summary}</span>
+        </span>
+        <span className={"k-chev" + (open ? " on" : "")}>›</span>
+      </button>
+      {open && <div style={S.sectionBody}>{children}</div>}
+    </div>
+  );
+}
+
 function SettingsView({ data, persist, setCats, onPull }) {
+  const [open, setOpen] = useState(null);
   const [newAcct, setNewAcct] = useState("");
   const [newCat, setNewCat] = useState({ in: "", out: "" });
   const [pAmount, setPAmount] = useState("");
   const [pLabel, setPLabel] = useState("");
+  const toggle = (id) => setOpen(open === id ? null : id);
+
+  const setAcct = (id, patch) =>
+    persist({
+      ...data,
+      accounts: data.accounts.map((x) => (x.id === id ? { ...x, ...patch } : x)),
+    });
 
   return (
     <>
-      <div style={S.blockHead}>Google Таблица</div>
-      <input
-        className="k-input"
-        placeholder="https://script.google.com/macros/s/…/exec"
-        value={data.sheetUrl || ""}
-        onChange={(e) => persist({ ...data, sheetUrl: e.target.value.trim() })}
-      />
-      <p style={S.hint}>
-        Записи, удаления и правки списков уходят в таблицу сами через несколько секунд.
-        Обратно приложение читает таблицу при каждом запуске.
-      </p>
-      <button className="k-ghost wide" style={{ marginTop: 10 }} onClick={onPull}>
-        Прочитать таблицу сейчас
-      </button>
-
-      <div style={S.blockHead}>Счета и карты</div>
-      <ul style={S.list}>
-        {data.accounts.map((a) => (
-          <li key={a.id} style={S.row}>
-            <input
-              className="k-inline"
-              value={a.name}
-              onChange={(e) =>
-                persist({
-                  ...data,
-                  accounts: data.accounts.map((x) =>
-                    x.id === a.id ? { ...x, name: e.target.value } : x
-                  ),
-                })
-              }
-            />
-            {["biz", "freeOnly"].map((flag) => (
+      <Section
+        title="Суммы на главной"
+        summary={
+          data.presets.length
+            ? data.presets.map((p) => nf.format(p.amount)).join(" · ")
+            : "нет кнопок"
+        }
+        open={open === "sums"}
+        onToggle={() => toggle("sums")}
+      >
+        <ul style={S.list}>
+          {data.presets.map((p) => (
+            <li key={p.id} style={S.row}>
+              <span style={{ ...S.rowCat, flex: 1 }}>
+                {money(p.amount)} · {p.label}
+              </span>
               <button
-                key={flag}
-                className={"k-chip tiny" + (a[flag] ? " on" : "")}
+                className="k-del"
                 onClick={() =>
-                  persist({
-                    ...data,
-                    accounts: data.accounts.map((x) =>
-                      x.id === a.id ? { ...x, [flag]: !x[flag] } : x
-                    ),
-                  })
+                  persist({ ...data, presets: data.presets.filter((x) => x.id !== p.id) })
                 }
+                aria-label="Убрать кнопку"
               >
-                {flag === "biz" ? "бизнес" : "своя сумма"}
+                ✕
               </button>
-            ))}
-            <button
-              className="k-del"
-              onClick={() =>
-                persist({ ...data, accounts: data.accounts.filter((x) => x.id !== a.id) })
-              }
-              aria-label="Убрать счёт"
-            >
-              ✕
-            </button>
-          </li>
-        ))}
-      </ul>
-      <div style={S.addRow}>
-        <input
-          className="k-input"
-          placeholder="Новая карта или счёт"
-          value={newAcct}
-          onChange={(e) => setNewAcct(e.target.value)}
-        />
-        <button
-          className="k-save small"
-          disabled={!newAcct.trim()}
-          onClick={() => {
-            persist({
-              ...data,
-              accounts: [...data.accounts, { id: "a" + Date.now(), name: newAcct.trim() }],
-            });
-            setNewAcct("");
-          }}
-        >
-          Добавить
-        </button>
-      </div>
-      <p style={S.hint}>Счета живут только в приложении — в журнал они идут комментарием.</p>
-
-      <div style={S.blockHead}>Кнопки сумм</div>
-      <ul style={S.list}>
-        {data.presets.map((p) => (
-          <li key={p.id} style={S.row}>
-            <span style={{ ...S.rowCat, flex: 1 }}>
-              {money(p.amount)} · {p.label}
-            </span>
-            <button
-              className="k-del"
-              onClick={() =>
-                persist({ ...data, presets: data.presets.filter((x) => x.id !== p.id) })
-              }
-              aria-label="Убрать кнопку"
-            >
-              ✕
-            </button>
-          </li>
-        ))}
-      </ul>
-      <div style={S.addRow}>
-        <input
-          className="k-input"
-          style={{ maxWidth: 96 }}
-          placeholder="Сумма"
-          inputMode="numeric"
-          value={pAmount}
-          onChange={(e) => setPAmount(e.target.value.replace(/\D/g, ""))}
-        />
-        <input
-          className="k-input"
-          placeholder="Название"
-          value={pLabel}
-          onChange={(e) => setPLabel(e.target.value)}
-        />
-        <button
-          className="k-save small"
-          disabled={!pAmount || !pLabel.trim()}
-          onClick={() => {
-            persist({
-              ...data,
-              presets: [
-                ...data.presets,
-                {
-                  id: "p" + Date.now(),
-                  amount: Number(pAmount),
-                  label: pLabel.trim(),
-                  cat: data.cats.in[0],
-                },
-              ],
-            });
-            setPAmount("");
-            setPLabel("");
-          }}
-        >
-          Добавить
-        </button>
-      </div>
-
-      {["in", "out"].map((k) => (
-        <div key={k}>
-          <div style={S.blockHead}>
-            {k === "in" ? "Источники дохода" : "Статьи расходов"}
-          </div>
-          <div style={S.catRow}>
-            {data.cats[k].map((c) => (
-              <button
-                key={c}
-                className="k-chip"
-                onClick={() => setCats(k, data.cats[k].filter((x) => x !== c))}
-              >
-                {c} ✕
-              </button>
-            ))}
-          </div>
-          <div style={S.addRow}>
-            <input
-              className="k-input"
-              placeholder={k === "in" ? "Новый источник" : "Новая статья"}
-              value={newCat[k]}
-              onChange={(e) => setNewCat({ ...newCat, [k]: e.target.value })}
-            />
-            <button
-              className="k-save small"
-              disabled={!newCat[k].trim()}
-              onClick={() => {
-                setCats(k, [...data.cats[k], newCat[k].trim()]);
-                setNewCat({ ...newCat, [k]: "" });
-              }}
-            >
-              Добавить
-            </button>
-          </div>
+            </li>
+          ))}
+        </ul>
+        <div style={S.addRow}>
+          <input
+            className="k-input"
+            style={{ maxWidth: 96 }}
+            placeholder="Сумма"
+            inputMode="numeric"
+            value={pAmount}
+            onChange={(e) => setPAmount(e.target.value.replace(/\D/g, ""))}
+          />
+          <input
+            className="k-input"
+            placeholder="Название"
+            value={pLabel}
+            onChange={(e) => setPLabel(e.target.value)}
+          />
+          <button
+            className="k-save small"
+            disabled={!pAmount || !pLabel.trim()}
+            onClick={() => {
+              persist({
+                ...data,
+                presets: [
+                  ...data.presets,
+                  {
+                    id: "p" + Date.now(),
+                    amount: Number(pAmount),
+                    label: pLabel.trim(),
+                    cat: data.lastCat?.in || data.cats.in[0],
+                  },
+                ],
+              });
+              setPAmount("");
+              setPLabel("");
+            }}
+          >
+            Добавить
+          </button>
         </div>
-      ))}
-      <p style={S.hint}>
-        Эти два списка синхронизируются с вкладкой «Настройки» в таблице: что добавили или
-        убрали здесь, то поменяется и там.
-      </p>
+      </Section>
+
+      <Section
+        title="Счета и карты"
+        summary={data.accounts.map((a) => a.name).join(" · ")}
+        open={open === "acct"}
+        onToggle={() => toggle("acct")}
+      >
+        {data.accounts.map((a) => (
+          <div key={a.id} style={S.acctCard}>
+            <div style={S.acctCardTop}>
+              <span
+                className="k-dot"
+                style={{
+                  background: PALETTE[(a.pal || 0) % PALETTE.length].c,
+                  flexShrink: 0,
+                }}
+              />
+              <input
+                className="k-inline"
+                value={a.name}
+                onChange={(e) => setAcct(a.id, { name: e.target.value })}
+              />
+              <button
+                className="k-del"
+                onClick={() =>
+                  persist({ ...data, accounts: data.accounts.filter((x) => x.id !== a.id) })
+                }
+                aria-label="Убрать счёт"
+              >
+                ✕
+              </button>
+            </div>
+            <div style={S.segLine}>
+              <span style={S.segLabel}>В таблицу пойдёт как</span>
+              <div style={S.seg}>
+                {[
+                  [false, "Личное"],
+                  [true, "Бизнес"],
+                ].map(([val, label]) => (
+                  <button
+                    key={label}
+                    className={"k-seg" + (!!a.biz === val ? " on" : "")}
+                    onClick={() => setAcct(a.id, { biz: val })}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={S.segLine}>
+              <span style={S.segLabel}>Отображать на главной</span>
+              <div style={S.seg}>
+                {[
+                  [false, "Суммы"],
+                  [true, "Только ввод"],
+                ].map(([val, label]) => (
+                  <button
+                    key={label}
+                    className={"k-seg" + (!!a.freeOnly === val ? " on" : "")}
+                    onClick={() => setAcct(a.id, { freeOnly: val })}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ))}
+        <div style={S.addRow}>
+          <input
+            className="k-input"
+            placeholder="Новая карта или счёт"
+            value={newAcct}
+            onChange={(e) => setNewAcct(e.target.value)}
+          />
+          <button
+            className="k-save small"
+            disabled={!newAcct.trim()}
+            onClick={() => {
+              persist({
+                ...data,
+                accounts: [
+                  ...data.accounts,
+                  {
+                    id: "a" + Date.now(),
+                    name: newAcct.trim(),
+                    pal: freePal(data.accounts),
+                  },
+                ],
+              });
+              setNewAcct("");
+            }}
+          >
+            Добавить
+          </button>
+        </div>
+        <p style={S.hint}>
+          «Личное» и «Бизнес» — это колонка «Контур» в журнале. Названия карт в таблице не
+          хранятся, они уходят в комментарий строки.
+        </p>
+      </Section>
+
+      <Section
+        title="Источники и статьи"
+        summary={
+          data.cats.in.length + " источников · " + data.cats.out.length + " статей"
+        }
+        open={open === "cats"}
+        onToggle={() => toggle("cats")}
+      >
+        {["in", "out"].map((k) => (
+          <div key={k}>
+            <div style={S.subHead}>
+              {k === "in" ? "Источники дохода" : "Статьи расходов"}
+            </div>
+            <div style={S.wrapRow}>
+              {data.cats[k].map((c) => (
+                <button
+                  key={c}
+                  className="k-chip"
+                  onClick={() => setCats(k, data.cats[k].filter((x) => x !== c))}
+                >
+                  {c} ✕
+                </button>
+              ))}
+            </div>
+            <div style={S.addRow}>
+              <input
+                className="k-input"
+                placeholder={k === "in" ? "Новый источник" : "Новая статья"}
+                value={newCat[k]}
+                onChange={(e) => setNewCat({ ...newCat, [k]: e.target.value })}
+              />
+              <button
+                className="k-save small"
+                disabled={!newCat[k].trim()}
+                onClick={() => {
+                  setCats(k, [...data.cats[k], newCat[k].trim()]);
+                  setNewCat({ ...newCat, [k]: "" });
+                }}
+              >
+                Добавить
+              </button>
+            </div>
+          </div>
+        ))}
+        <p style={S.hint}>
+          Списки общие с вкладкой «Настройки» в таблице и синхронизируются в обе стороны.
+        </p>
+      </Section>
+
+      <Section
+        title="Связь с таблицей"
+        summary={data.sheetUrl ? "подключена" : "не подключена"}
+        open={open === "sheet"}
+        onToggle={() => toggle("sheet")}
+      >
+        <input
+          className="k-input"
+          placeholder="https://script.google.com/macros/s/…/exec"
+          value={data.sheetUrl || ""}
+          onChange={(e) => persist({ ...data, sheetUrl: e.target.value.trim() })}
+        />
+        <button className="k-ghost wide" style={{ marginTop: 10 }} onClick={onPull}>
+          Прочитать таблицу сейчас
+        </button>
+        <p style={S.hint}>
+          Записи уходят в таблицу сами. Обратно приложение читает её при запуске и по
+          нажатию на «Таблица» в шапке.
+        </p>
+      </Section>
     </>
   );
 }
@@ -1075,7 +1648,7 @@ const S = {
       "ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
     color: INK,
   },
-  frame: { maxWidth: 440, margin: "0 auto", position: "relative" },
+  frame: { margin: "0 auto", position: "relative" },
   header: {
     display: "flex",
     alignItems: "flex-start",
@@ -1084,30 +1657,36 @@ const S = {
   },
   headerLabel: { fontSize: 13, color: MUTED },
   headerSum: {
-    fontSize: 32,
     fontWeight: 750,
     letterSpacing: -1,
     fontVariantNumeric: "tabular-nums",
     marginTop: 3,
   },
   headerRight: { display: "flex", alignItems: "center", gap: 8 },
-  acctRow: { display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 16 },
+  acctRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(6, 1fr)",
+    gap: 7,
+    marginBottom: 16,
+  },
   monthRow: { display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 14 },
   main: { paddingBottom: 100, minHeight: 320 },
-  presets: { display: "grid", gap: 10, marginBottom: 26 },
+  presets: { gap: 10 },
+  freqRow: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 12 },
   sectionHead: {
     display: "flex",
     justifyContent: "space-between",
     fontSize: 13,
     color: MUTED,
-    padding: "18px 2px 8px",
+    padding: "26px 2px 8px",
   },
   list: { listStyle: "none", margin: 0, padding: 0 },
   row: {
     display: "flex",
     alignItems: "center",
     gap: 9,
-    padding: "11px 10px",
+    padding: "4px 12px 4px 12px",
+    minHeight: 52,
     background: "#FFFFFF",
     borderRadius: 12,
     marginBottom: 6,
@@ -1150,6 +1729,16 @@ const S = {
     fontSize: 13,
     marginBottom: 12,
   },
+  syncFloat: {
+    position: "sticky",
+    bottom: 78,
+    background: "#DFE9DE",
+    color: "#2C5340",
+    padding: "11px 14px",
+    borderRadius: 12,
+    fontSize: 13,
+    marginTop: 14,
+  },
   syncNote: {
     background: "#DFE9DE",
     color: "#2C5340",
@@ -1179,10 +1768,8 @@ const S = {
   sheet: {
     background: "#F3F5F1",
     width: "100%",
-    maxWidth: 440,
     padding: "10px 14px 18px",
     borderRadius: "20px 20px 0 0",
-    maxHeight: "94%",
     overflowY: "auto",
   },
   grabber: {
@@ -1205,8 +1792,15 @@ const S = {
     fontVariantNumeric: "tabular-nums",
     letterSpacing: -1,
   },
-  catRow: { display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 12 },
-  pad: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 7, margin: "14px 0" },
+  catRow: {
+    display: "flex",
+    gap: 7,
+    marginBottom: 12,
+    overflowX: "auto",
+    paddingBottom: 4,
+    WebkitOverflowScrolling: "touch",
+  },
+  pad: { gap: 7, margin: "14px 0" },
   padActions: { display: "flex", gap: 8 },
   totals: {
     display: "grid",
@@ -1237,6 +1831,66 @@ const S = {
   barTrack: { height: 7, background: "#DCE0D9", borderRadius: 7 },
   barFill: { height: 7, background: "#15653F", borderRadius: 7 },
   addRow: { display: "flex", gap: 7, marginTop: 8 },
+  wrapRow: { display: "flex", flexWrap: "wrap", gap: 7 },
+  section: { marginBottom: 8 },
+  sectionText: { display: "flex", flexDirection: "column", gap: 3, minWidth: 0, textAlign: "left" },
+  sectionTitle: { fontSize: 16, fontWeight: 600, color: INK },
+  sectionSummary: {
+    fontSize: 13,
+    color: MUTED,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  sectionBody: { padding: "4px 2px 18px" },
+  subHead: { fontSize: 13, color: MUTED, padding: "16px 2px 8px" },
+  logBar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    fontSize: 13,
+    color: MUTED,
+    padding: "0 2px 14px",
+  },
+  monthSum: {
+    fontSize: 15,
+    fontWeight: 700,
+    fontVariantNumeric: "tabular-nums",
+    flexShrink: 0,
+    marginLeft: "auto",
+  },
+  pendingDot: {
+    display: "inline-block",
+    width: 6,
+    height: 6,
+    borderRadius: 6,
+    background: "#C2410C",
+    marginLeft: 6,
+    verticalAlign: "middle",
+  },
+  acctCard: {
+    background: "#FFFFFF",
+    borderRadius: 14,
+    padding: "12px 14px 14px",
+    marginBottom: 8,
+  },
+  acctCardTop: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    paddingBottom: 10,
+    marginBottom: 10,
+    borderBottom: "1px solid #EDEFEA",
+  },
+  segLine: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    marginTop: 8,
+  },
+  segLabel: { fontSize: 13, color: MUTED, flex: 1, minWidth: 0 },
+  seg: { display: "flex", background: "#F0F2ED", borderRadius: 999, padding: 3, flexShrink: 0 },
   hint: { fontSize: 13, color: "#9AA09A", lineHeight: 1.45, margin: "10px 2px 0" },
 };
 
@@ -1244,37 +1898,93 @@ function Style() {
   return (
     <style>{`
       .k-preset {
-        display: flex; align-items: baseline; gap: 13px; width: 100%;
-        text-align: left; cursor: pointer; background: #FFFFFF; border: none;
-        border-radius: 16px; padding: 18px 18px; font: inherit; color: inherit;
-        box-shadow: 0 1px 2px rgba(20,25,20,.05), 0 6px 16px rgba(20,25,20,.05);
+        display: flex; align-items: center; justify-content: space-between; gap: 14px;
+        width: 100%; min-height: 96px; text-align: left; cursor: pointer;
+        background: #FFFFFF; border: none; border-radius: 20px;
+        padding: 20px 22px; font: inherit; color: inherit;
+        box-shadow: 0 1px 2px rgba(20,25,20,.05), 0 8px 20px rgba(20,25,20,.06);
         transition: transform .09s ease, box-shadow .12s ease;
       }
-      .k-preset:active { transform: scale(.982); box-shadow: 0 1px 2px rgba(20,25,20,.06); }
-      .k-preset-sum { font-size: 32px; font-weight: 750; letter-spacing: -1.2px; font-variant-numeric: tabular-nums; }
-      .k-preset-label { font-size: 14px; color: #7B8280; }
-      .k-preset.alt .k-preset-sum, .k-preset.solo .k-preset-sum { color: #9AA09A; letter-spacing: 2px; }
-      .k-preset.solo { padding: 30px 18px; }
+      .k-preset:active { transform: scale(.975); box-shadow: 0 1px 2px rgba(20,25,20,.06); }
+      .k-preset.done .k-preset-label { color: #15653F; font-weight: 600; }
+      .k-preset.done .k-preset-plus { background: #15653F; color: #fff; }
+      .k-freq.done { border-color: #15653F; color: #15653F; }
+      .k-preset-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+      .k-preset-sum { font-size: 40px; font-weight: 760; letter-spacing: -1.6px; line-height: 1; font-variant-numeric: tabular-nums; }
+      .k-preset-label { font-size: 14.5px; color: #7B8280; }
+      .k-preset-plus {
+        width: 38px; height: 38px; flex-shrink: 0; border-radius: 999px;
+        background: #F0F2ED; color: #8A918A; font-size: 21px; font-weight: 500;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .k-preset.alt, .k-preset.solo { min-height: 78px; box-shadow: none; background: #FFFFFF99; }
+      .k-preset.alt .k-preset-sum, .k-preset.solo .k-preset-sum {
+        color: #9AA09A; font-size: 26px; letter-spacing: 3px;
+      }
+      .k-preset.solo { min-height: 110px; }
+
+      .k-link {
+        background: transparent; border: none; color: #15653F;
+        font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+        padding: 6px 2px;
+      }
+      .k-link:disabled { color: #9AA09A; }
+
+      .k-section {
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        width: 100%; background: #FFFFFF; border: none; border-radius: 14px;
+        padding: 15px 16px; font: inherit; color: inherit; cursor: pointer;
+      }
+      .k-section:active { background: #F7F8F5; }
+      .k-chev {
+        color: #B6BCB6; font-size: 22px; line-height: 1; flex-shrink: 0;
+        transform: rotate(90deg); transition: transform .18s ease;
+      }
+      .k-chev.on { transform: rotate(-90deg); }
+
+      .k-seg {
+        background: transparent; border: none; color: #7B8280;
+        min-height: 34px; padding: 0 13px; border-radius: 999px;
+        font: inherit; font-size: 13.5px; cursor: pointer; white-space: nowrap;
+      }
+      .k-seg.on { background: #FFFFFF; color: #16191A; font-weight: 600; box-shadow: 0 1px 3px rgba(20,25,20,.10); }
+
+      .k-freq {
+        background: #FFFFFF; border: 1px solid #E3E6E0; color: #16191A;
+        min-height: 44px; padding: 0 18px; border-radius: 999px;
+        font: inherit; font-size: 16px; font-weight: 600; cursor: pointer;
+        font-variant-numeric: tabular-nums;
+      }
+      .k-freq:active { background: #F0F2ED; }
 
       .k-acct {
-        display: inline-flex; align-items: center; gap: 7px;
+        display: flex; align-items: center; justify-content: center; gap: 7px;
+        min-width: 0; overflow: hidden;
         background: #FFFFFF; border: 1.5px solid transparent; color: #5A625E;
-        padding: 9px 14px; border-radius: 999px; font: inherit; font-size: 14px; cursor: pointer;
+        min-height: 44px; padding: 0 16px; border-radius: 999px;
+        font: inherit; font-size: 14.5px; cursor: pointer;
         transition: color .12s ease, border-color .12s ease;
       }
       .k-acct.on { color: #16191A; font-weight: 600; }
+      .k-acct-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .k-dot { width: 8px; height: 8px; border-radius: 8px; display: inline-block; }
 
       .k-chip {
         background: #FFFFFF; border: 1px solid #E3E6E0; color: #5A625E;
-        padding: 8px 13px; border-radius: 999px; font: inherit; font-size: 13.5px; cursor: pointer;
+        min-height: 40px; padding: 0 15px; border-radius: 999px;
+        font: inherit; font-size: 14px; cursor: pointer; white-space: nowrap;
       }
-      .k-chip.tiny { font-size: 12px; padding: 5px 10px; }
+      .k-chip.tiny { font-size: 12px; min-height: 32px; padding: 0 11px; }
       .k-chip.on { color: #FFFFFF; background: #16191A; border-color: #16191A; }
+      .k-chip.date { position: relative; display: inline-flex; align-items: center; }
+      .k-chip.date input {
+        position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%;
+        border: none; padding: 0;
+      }
 
       .k-tab {
         position: relative; background: transparent; border: none;
-        padding: 14px 0 16px; font: inherit; font-size: 14px; color: #9AA09A; cursor: pointer;
+        padding: 16px 0 18px; font: inherit; font-size: 14.5px; color: #9AA09A; cursor: pointer;
       }
       .k-tab.on { color: #16191A; font-weight: 650; }
       .k-tab.on span::after {
@@ -1331,22 +2041,82 @@ function Style() {
       }
       .k-input:focus-visible, .k-inline:focus-visible { outline: 2px solid #15653F; outline-offset: 1px; }
 
+      .k-rowmain {
+        display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0;
+        background: transparent; border: none; padding: 12px 0;
+        font: inherit; color: inherit; text-align: left; cursor: pointer;
+      }
+      .k-link.danger { color: #A33421; }
+
       .k-del {
         background: transparent; border: none; color: #C3C8C2;
-        font-size: 15px; cursor: pointer; padding: 4px 6px; flex-shrink: 0;
+        font-size: 16px; cursor: pointer; flex-shrink: 0;
+        width: 40px; height: 40px; margin: -8px -10px -8px 0;
       }
       .k-del:active { color: #A33421; }
 
       .k-undo {
         background: transparent; border: 1px solid #4A514C; color: #F4F6F2;
-        padding: 8px 13px; border-radius: 999px; font: inherit; font-size: 13px;
-        cursor: pointer; flex-shrink: 0;
+        min-height: 38px; padding: 0 15px; border-radius: 999px;
+        font: inherit; font-size: 13.5px; cursor: pointer; flex-shrink: 0;
       }
+      .k-toast-input {
+        flex: 1; min-width: 0; background: transparent; border: none;
+        border-bottom: 1px solid #4A514C; color: #F4F6F2;
+        font: inherit; font-size: 16px; padding: 6px 2px;
+      }
+      .k-toast-input::placeholder { color: #8A928C; }
+      .k-toast-input:focus { outline: none; }
 
       @keyframes k-in-left  { from { opacity: 0; transform: translateX(26px); } to { opacity: 1; transform: none; } }
       @keyframes k-in-right { from { opacity: 0; transform: translateX(-26px); } to { opacity: 1; transform: none; } }
       .k-slide-left  { animation: k-in-left .22s ease-out; }
       .k-slide-right { animation: k-in-right .22s ease-out; }
+
+      /* ── Раскладка и адаптив ─────────────────────────────── */
+      .k-frame { max-width: 440px; }
+      .k-presets { display: grid; }
+      .k-pad { display: grid; grid-template-columns: repeat(3, 1fr); }
+      .k-sheet { max-width: 440px; max-height: 94%; }
+      .k-headsum { font-size: clamp(26px, 8.5vw, 34px); }
+      .k-preset-sum { font-size: clamp(30px, 9.5vw, 42px); }
+
+      .k-scroll { scrollbar-width: none; }
+      .k-scroll::-webkit-scrollbar { display: none; }
+
+      /* Узкие телефоны: SE, mini */
+      @media (max-width: 360px) {
+        .k-preset { min-height: 82px; padding: 16px 16px; }
+        .k-preset-plus { width: 32px; height: 32px; font-size: 19px; }
+        .k-acct { font-size: 13.5px; padding: 0 10px; }
+        .k-key { padding: 14px 0; font-size: 20px; }
+      }
+
+      /* Альбомная ориентация: клавиатура не должна уезжать за экран */
+      @media (orientation: landscape) and (max-height: 520px) {
+        .k-presets { grid-template-columns: 1fr 1fr; }
+        .k-sheet { max-width: 620px; max-height: 98%; }
+        .k-pad { gap: 5px; }
+        .k-key { padding: 11px 0; font-size: 19px; }
+        .k-preset { min-height: 78px; }
+      }
+
+      /* Планшеты и десктоп */
+      @media (min-width: 700px) {
+        .k-frame { max-width: 560px; }
+        .k-sheet { max-width: 520px; border-radius: 20px; margin-bottom: 24px; }
+        .k-presets { grid-template-columns: 1fr 1fr; }
+        .k-preset.alt, .k-preset.solo { grid-column: 1 / -1; }
+      }
+
+      /* Мышь вместо пальца */
+      @media (hover: hover) and (pointer: fine) {
+        .k-preset:hover { box-shadow: 0 2px 6px rgba(20,25,20,.08), 0 12px 26px rgba(20,25,20,.09); }
+        .k-chip:hover, .k-acct:hover, .k-freq:hover, .k-key:hover { background: #F7F8F5; }
+        .k-section:hover { background: #FAFBF9; }
+        .k-del:hover { color: #A33421; }
+        .k-link:hover { text-decoration: underline; }
+      }
 
       button:focus-visible { outline: 2px solid #15653F; outline-offset: 2px; }
       @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
